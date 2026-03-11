@@ -2,15 +2,17 @@
 library(NMF)
 library(matrixStats)
 library(doParallel)
-
-# Full script: Entrez->SYMBOL, GT heatmap, UMAP, ML on GT genes
-# Requires: data.table, GEOquery, DESeq2, org.Hs.eg.db, umap, car, pheatmap, randomForest, xgboost, e1071, caret
-# R version compatible with packages used
-
+library(ggplot2)
+library(tidyr)
+#extended tests and other plots
+library(FSA)        # for dunnTest
+library(pheatmap)
+library(RColorBrewer)
 library(data.table)
 library(GEOquery)
 library(DESeq2)
 library(org.Hs.eg.db)
+library(clusterProfiler)
 library(umap)
 library(car)
 library(pheatmap)
@@ -19,6 +21,10 @@ library(xgboost)
 library(e1071)
 library(caret)
 library(dplyr)
+
+# Full script: Entrez->SYMBOL, GT heatmap, UMAP, ML on GT genes
+# Requires: data.table, GEOquery, DESeq2, org.Hs.eg.db, umap, car, pheatmap, randomForest, xgboost, e1071, caret
+# R version compatible with packages used
 
 # --------------------------
 # 1. Load counts & metadata
@@ -77,7 +83,6 @@ na_count <- sum(is.na(symbol_map))
 message("Mapped ", length(entrez_ids) - na_count, " Entrez IDs to SYMBOLs; ", na_count, " had no SYMBOL mapping (kept as Entrez IDs).")
 
 
-
 tumor_samples <- metadata %>%
   filter(Tumor_Normal == "Tumor") %>%
   pull(SampleID)
@@ -88,6 +93,27 @@ dim(tbl_tumorSym)
 metadata2<- metadata[tumor_samples,]
 metadata2
 dim(metadata2) 
+
+gt_genes <- c(
+  # GALNT family (N-acetylgalactosaminyltransferases)
+  paste0("GALNT", 1:20),
+  # MGAT family (mannosyl (alpha-1,3-)-glycoprotein beta-1,2-N-acetylglucosaminyltransferase)
+  paste0("MGAT", 1:5),
+  # B3GALT family
+  paste0("B3GALT", 1:6),
+  # B4GALT family
+  paste0("B4GALT", 1:7),
+  # FUT family (fucosyltransferases)
+  paste0("FUT", 1:11),
+  # ST3GAL, ST6GAL, ST9SIA families (sialyltransferases)
+  paste0("ST3GAL", 1:6),
+  paste0("ST6GAL", 1:2),
+  paste0("ST9SIA", 1:6),
+  # Misc others (common GTs)
+  c("POFUT1","POFUT2","OGT","LARGE1","LARGE2","POMGNT1","POMT1","POMT2","MAN1A1")
+)
+
+write.csv(gt_genes,"gt_genes.csv")
 
 
 # --------------------------
@@ -103,8 +129,6 @@ library(fastTopics)
 m <- as.matrix(tbl_tumorSym)
 dim(m)
 m[1:3,1:3]
-library(fastTopics)
-
 X <- t(m)  # now 42 samples × 29,534 genes
 dim(X)
 
@@ -115,6 +139,7 @@ K <- 2:20
 fits <- lapply(K, function(k) {
   fit_poisson_nmf(X, k = k, numiter = 1000)
 })
+
 
 names(fits) <- paste0("K", K)
 
@@ -138,11 +163,10 @@ library(inflection)
 
 uik(K,elbo)
 #k=8
-library(dplyr)
-library(ggplot2)
-library(matrixStats)
 
+#fits<-A<-readRDS("fits.rds")
 best_k <- 8
+
 fit <- fits[[paste0("K", best_k)]]
 
 theta <- fit$L   # samples × topics (topic activity)
@@ -168,7 +192,6 @@ kw_results <- data.frame(
 
 kw_results
 
-GT<-read.csv("gt_genes.csv")
 gt_genes<-GT$x 
 
 gene_list<-rownames(beta)
@@ -191,14 +214,41 @@ gt_results <- data.frame(
   Pvalue = gt_topic_pvals,
   AdjPvalue = gt_topic_adj
 )
-
 gt_results
-
 
 gt_enriched_topics <- gt_results %>%
   filter(AdjPvalue < 0.05)
 
 gt_enriched_topics
+
+
+pdf("Metagene_boxplots_Wilcoxon.pdf", width = 10, height = 5)
+
+par(mfrow = c(2,4))
+
+for (k in 1:8) {
+  
+  wt <- wilcox.test(
+    beta[gt_idx, k],
+    beta[!gt_idx, k],
+    exact = FALSE
+  )
+  
+  boxplot(
+    list(
+      "Non-GT" = beta[!gt_idx, k],
+      "GT"     = beta[gt_idx, k]
+    ),
+    main = paste0(
+      "Metagene ", k,
+      "\nadj p-value = ", format.pval(gt_results$AdjPvalue[k], digits = 3)
+    ),
+    ylab = "Gene loading",
+    outline = FALSE
+  )
+}
+
+dev.off()
 
 
 
@@ -219,9 +269,6 @@ gt_enriched_topics <- gt_results %>%
   filter(AdjPvalue < 0.05)
 
 gt_enriched_topics
-
-library(dplyr)
-library(tidyr)
 
 theta_long <- theta_df %>%
   mutate(SampleID = rownames(theta_df)) %>%
@@ -260,7 +307,6 @@ dev.off()
 file.exists("NMF_rank8_H_heatmap.png")
 
 
-library(matrixStats)
 
 # Select the top 200 highest-loading genes across all metagenes
 top_genes_idx <- order(rowMaxs(W), decreasing = TRUE)[1:100]
@@ -294,10 +340,6 @@ pheatmap(
 )
 
 dev.off()
-
-
-
-
 
 
 H_t <- t(H)   # samples x 8
@@ -342,61 +384,31 @@ colnames(H)<-c("Metagene 1","Metagene 2","Metagene 3",
                "Metagene 8")
 metagenes<-colnames(H)
 
-if (is.null(genes)) stop("expr_meta has no rownames")
-if (is.null(metagenes)) stop("H has no rownames")
 
-# compute correlation: for each metagene (row of H) vs each gene (row of expr_meta)
-cors <- sapply(genes, function(gene) {
-  sapply(metagenes, function(metagene) {
-    cor(H[,metagene], expr_meta[gene, ], method = "spearman", 
-        use = "pairwise.complete.obs")
-  })
-})
 
-# transpose so rows = metagenes, cols = genes
-cors <- t(cors)
+dim(H)          # should be n_metagenes x n_samples
+dim(expr_meta)  # should be n_genes x n_samples
 
-dim(cors)
-cors
+# If not, transpose H:
+H <- t(H)       # maybe needed
 
-# Heatmap
-png("NMF_rank10_metagene_metadata_correlation.png",
-    width = 1600, height = 2000, res = 200)
 
-cors
-pheatmap(
-  cors,
-  cluster_rows = TRUE,
-  cluster_cols = TRUE,
-  color = colorRampPalette(brewer.pal(9, "RdBu"))(200),
-  main = "Correlation of NMF Metagenes with Metadata",
-  fontsize = 10,
-  border_color = NA
-)
-dev.off()
+common_samples <- intersect(colnames(H), colnames(expr_meta))
+H <- H[, common_samples]
+expr_meta <- expr_meta[, common_samples]
+  
+cor_mat <- matrix(NA, nrow=nrow(H), ncol=nrow(expr_meta),
+                    dimnames=list(rownames(H), rownames(expr_meta)))
+p_mat <- matrix(NA, nrow=nrow(H), ncol=nrow(expr_meta),
+                dimnames=list(rownames(H), rownames(expr_meta)))
 
-# H = NMF metagene matrix (metagenes × samples)
-# expr_meta = matrix of metadata genes (genes × samples)
-# Both MUST have matching columns (samples)
-
-cor_mat <- matrix(NA,
-                  nrow = nrow(H),
-                  ncol = nrow(expr_meta),
-                  dimnames = list(rownames(H), rownames(expr_meta)))
-
-p_mat <- cor_mat
-
-# --- Spearman correlation for ALL 2000 genes ---
 for (metagene in rownames(H)) {
   for (gene in rownames(expr_meta)) {
-    test <- suppressWarnings(cor.test(H[metagene,], expr_meta[gene, ], method = "spearman"))
+    test <- suppressWarnings(cor.test(H[metagene, ], expr_meta[gene, ], method="spearman"))
     cor_mat[metagene, gene] <- test$estimate
-    p_mat[metagene, gene]   <- test$p.value
+    p_mat[metagene, gene] <- test$p.value
   }
 }
-
-p_mat
-
 # matrix where non–sig values are set to 0, sig kept
 cor_masked <- cor_mat
 
@@ -420,7 +432,8 @@ library(grid)
 
 pdf("correlation_heatmap.pdf", width = 9, height = 6)
 
-ph <- pheatmap(
+ph <- 
+  pheatmap(
   cor_masked,
   cluster_rows = TRUE,
   cluster_cols = TRUE,
@@ -435,134 +448,10 @@ ph <- pheatmap(
   show_rownames = TRUE
 )
 
-
 dev.off()
-
-#pick cor_genes per metagene (abs(cor)>0.5)
-# assume your correlation matrix is called 'cors'
-# rownames(cors) = gene names, columns = metagenes
-
-# 1. Find entries with |correlation| > 0.6
-sig_idx <- which(abs(cors) > 0.5, arr.ind = TRUE)
-
-# 2. Extract the genes and metagenes
-sig_genes <- data.frame(
-  gene  = rownames(cors)[sig_idx[, 1]],
-  metagene = colnames(cors)[sig_idx[, 2]],
-  cor   = cors[sig_idx]
-)
-
-# 3. Remove duplicates (if any)
-sig_genes <- sig_genes[order(abs(sig_genes$cor), decreasing = TRUE), ]
-
-sig_genes
-
-#extract Positive & Negative Correlated Genes per metagene (R)
-
-#1. Set threshold
-threshold <- 0.5
-
-#2. Extract per-metagene positive & negative gene lists
-# Create lists
-positive_list <- list()
-negative_list <- list()
-
-metagenes <- colnames(cors)
-genes  <- rownames(cors)
-
-for (tp in metagenes) {
-  
-  # Extract correlations for this metagene
-  vec <- cors[, tp]
-  
-  # Positive correlations > +0.5
-  pos_genes <- names(vec[vec > threshold])
-  
-  # Negative correlations < –0.5
-  neg_genes <- names(vec[vec < -threshold])
-  
-  # Store
-  positive_list[[tp]] <- data.frame(
-    gene = pos_genes,
-    correlation = vec[pos_genes]
-  )
-  
-  negative_list[[tp]] <- data.frame(
-    gene = neg_genes,
-    correlation = vec[neg_genes]
-  )
-}
-
-#3. View results
-#Positive genes per metagene
-positive_list
-
-#Negative genes per metagene
-negative_list
-
-#4. Example: Positive genes for metagene4
-positive_list[["metagene2"]]
-positive_list
-
-#5. Example: Negative genes for metagene1
-negative_list[["metagene1"]]
-
 
 ################################################################################
 ######comparison with GT genes
-
-gt_genes <- c(
-  # GALNT family (N-acetylgalactosaminyltransferases)
-  paste0("GALNT", 1:20),
-  # MGAT family (mannosyl (alpha-1,3-)-glycoprotein beta-1,2-N-acetylglucosaminyltransferase)
-  paste0("MGAT", 1:5),
-  # B3GALT family
-  paste0("B3GALT", 1:6),
-  # B4GALT family
-  paste0("B4GALT", 1:7),
-  # FUT family (fucosyltransferases)
-  paste0("FUT", 1:11),
-  # ST3GAL, ST6GAL, ST9SIA families (sialyltransferases)
-  paste0("ST3GAL", 1:6),
-  paste0("ST6GAL", 1:2),
-  paste0("ST9SIA", 1:6),
-  # Misc others (common GTs)
-  c("POFUT1","POFUT2","OGT","LARGE1","LARGE2","POMGNT1","POMT1","POMT2","MAN1A1")
-)
-
-write.csv(gt_genes,"gt_genes.csv")
-
-# --------------------------
-# 6. GT gene heatmap
-# --------------------------
-
-W #tbl_tumorSym
-present_genes<- W[rownames(W) %in% gt_genes,]
-# Annotate samples with Organ and Tumor_Normal
-annotation_col <- metadata[, c("Organ"), drop=FALSE]
-dim(annotation_col)
-annot_tumor<-data.frame(tumor_samples,Organ=annotation_col[rownames(annotation_col) %in% tumor_samples,])
-rownames(annot_tumor)<-tumor_samples
-annot_tumor$tumor_samples<-NULL
-annot_tumor
-
-# Scale rows (genes) for heatmap display (z-score)
-gt_mat_z <- t(scale(t(present_genes)))
-
-pheatmap(
-  t(gt_mat_z),
-  cluster_rows = TRUE,
-  cluster_cols = TRUE,
-  #annotation_col = annot_tumor,
-  show_rownames = TRUE,
-  show_colnames = FALSE,
-  fontsize_row = 9,
-  main = "GT genes heatmap (z-scored)"
-)
-
-
-W[1:3,1:3]
-
 
 present_gt <- intersect(gt_genes, rownames(W))
 present_gt
@@ -596,18 +485,16 @@ pheatmap::pheatmap(
   main = "GT gene contributions to NMF metagenes"
 )
 
-
 gt_flag <- rownames(W) %in% present_gt
-
 
 
 par(mfrow = c(2, 4))  # layout: 2 rows, 4 columns (adjust if needed)
 
-for (k in 1:10) {
+for (k in 1:8) {
   
   boxplot(
     W[, k] ~ gt_flag,
-   # W_top100
+    # W_top100
     names = c("Non-GT", "GT"),
     main = paste("Metagene", k),
     ylab = "Gene loading"
@@ -625,40 +512,6 @@ for (k in 1:10) {
 dev.off()
 
 
-pdf("Metagene_boxplots_Wilcoxon.pdf", width = 10, height = 5)
-par(mfrow = c(2, 5))  # optional: layout for 10 metagenes
-for (k in 1:8) {
-  
-  wt <- wilcox.test(
-    W[gt_idx, k],
-    W[!gt_idx, k],
-    exact = FALSE
-  )
-  
-  boxplot(
-    list(
-      "Non-GT" = W[!gt_idx, k],
-      "GT"     = W[gt_idx, k]
-    ),
-    main = paste0(
-      "Metagene ", k,
-      "\nWilcoxon p = ", format.pval(wt$p.value, digits = 3)
-    ),
-    ylab = "Gene loading",
-    outline = FALSE
-  )
-}
-
-dev.off()
-
-#extended tests and other plots
-library(dplyr)
-library(tidyr)
-library(ggplot2)
-library(FSA)        # for dunnTest
-library(pheatmap)
-library(RColorBrewer)
-
 # Assuming H = metagene activity matrix (samples x metagenes)
 # metadata2 = tumor-only sample metadata with Organ column
 # W = gene loadings (genes x metagenes)
@@ -667,10 +520,10 @@ library(RColorBrewer)
 # -----------------------------------------
 # 1. Kruskal-Wallis test per metagene
 # -----------------------------------------
-kw_results <- lapply(1:ncol(H), function(k) {
+kw_results <- lapply(1:nrow(H), function(k) {
   df <- data.frame(
-    activity = H[, k],
-    cancer   = metadata2$Organ
+    activity = H[k, ],           # row = metagene
+    cancer   = metadata2$Organ   # must have same length as number of columns
   )
   
   kw <- kruskal.test(activity ~ cancer, data = df)
@@ -682,6 +535,7 @@ kw_results <- lapply(1:ncol(H), function(k) {
   )
 }) %>% bind_rows()
 
+
 kw_results$P_adj <- p.adjust(kw_results$P_value, method = "BH")
 print(kw_results)
 
@@ -690,7 +544,7 @@ tiff("KruskalWallis_pvalues.tiff", width = 8, height = 5, units = "in", res = 30
 ggplot(kw_results, aes(x = Metagene, y = -log10(P_adj), fill = P_adj < 0.05)) +
   geom_col() +
   geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") +
-  scale_fill_manual(values = c("grey", "forestgreen"), name = "Significant") +
+  scale_fill_manual(values = c("grey", "black"), name = "Significant") +
   labs(title = "Kruskal-Wallis test per Metagene (adjusted p-values)",
        y = "-log10(FDR adjusted p-value)", x = "Metagene") +
   theme_minimal() +
@@ -702,7 +556,7 @@ dev.off()
 # -----------------------------------------
 dunn_results <- lapply(which(kw_results$P_adj < 0.05), function(k) {
   df <- data.frame(
-    activity = H[, k],
+    activity = H[k, ],
     cancer   = metadata2$Organ
   )
   
@@ -761,24 +615,6 @@ dev.off()
 # -----------------------------------------
 # 3. Wilcoxon test boxplots GT vs Non-GT genes per metagene
 # -----------------------------------------
-tiff("Wilcoxon_GT_vs_nonGT_boxplots.tiff", width = 10, height = 8, units = "in", res = 300)
-par(mfrow = c(2, 5), mar = c(5, 4, 4, 1))
-
-for (k in 1:ncol(W)) {
-  wt <- wilcox.test(W[gt_genes, k], W[!rownames(W) %in% gt_genes, k], exact = FALSE)
-  
-  boxplot(
-    list(
-      "Non-GT" = W[!rownames(W) %in% gt_genes, k],
-      "GT"     = W[gt_genes, k]
-    ),
-    main = paste0("Metagene ", k, "\nWilcoxon p = ", format.pval(wt$p.value, digits = 3)),
-    ylab = "Gene loading",
-    outline = FALSE,
-    col = c("grey80", "forestgreen")
-  )
-}
-dev.off()
 
 # -----------------------------------------
 # 4. Fisher's exact test sensitivity analysis (top N genes)
@@ -859,7 +695,7 @@ tiff("Fisher_final_pvalues.tiff", width = 8, height = 5, units = "in", res = 300
 ggplot(fisher_final, aes(x = Metagene, y = -log10(P_adj), fill = P_adj < 0.05)) +
   geom_col() +
   geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") +
-  scale_fill_manual(values = c("grey", "forestgreen"), name = "Significant") +
+  scale_fill_manual(values = c("grey", "black"), name = "Significant") +
   labs(title = paste0("Fisher's Exact Test (top ", final_cutoff, " genes)"),
        y = "-log10(FDR adjusted p-value)",
        x = "Metagene") +
@@ -881,8 +717,164 @@ glm_all <- glm(I(rownames(W) %in% gt_genes) ~ ., data = as.data.frame(W), family
 summary(glm_all)
 
 
+genes_all <- rownames(W)
+genes_all <- make.unique(genes_all)
+rownames(W) <- genes_all
+
+#3 Define GT and non-GT gene sets (tumorSymBOLS)
+gt_genes_sym     <- intersect(gt, rownames(W))
+non_gt_genes_sym <- setdiff(rownames(W), gt)
+
+#4) Function: extract TOP 50 genes per metagene
+get_top50 <- function(W, gene_set, k) {
+  wk <- W[gene_set, k, drop = FALSE]
+  top50 <- names(sort(wk[,1], decreasing = TRUE))[1:min(100, nrow(wk))]
+  return(top50)
+}
+
+#5 GO enrichment function (SYMBOL-based)
+run_go <- function(gene_symbols, title_tag) {
+  
+  ego <- enrichGO(
+    gene          = gene_symbols,
+    OrgDb         = org.Hs.eg.db,
+    keyType       = "SYMBOL",
+    ont           = "BP",
+    pAdjustMethod = "BH",
+    qvalueCutoff  = 0.05,
+    readable      = TRUE
+  )
+  
+  if (is.null(ego) || nrow(ego@result) == 0) {
+    message("No significant GO terms for ", title_tag)
+    return(NULL)
+  }
+  
+  dotplot(ego, showCategory = 10) +
+    ggtitle(title_tag)
+}
+
+##pick Metagene 8 according to enrichment result by Organs 
+# Run GO enrichment for GT vs non-GT (Top 50) per metagene
+pdf("GO_enrichment_GT_vs_nonGT_Top50.pdf", width = 10, height = 7)
+
+for (k in 1:8) {
+  
+  cat("\n===== Metagene", k, "=====\n")
+  
+  # --- GT genes ---
+  top50_GT <- get_top50(W, gt_genes_sym, k)
+  p1 <- run_go(top50_GT,
+               paste("Metagene", k, "- GT genes (Top 100)"))
+  if (!is.null(p1)) print(p1)
+  
+  # --- Non-GT genes ---
+  top50_nonGT <- get_top50(W, non_gt_genes_sym, k)
+  p2 <- run_go(top50_nonGT,
+               paste("Metagene", k, "- Non-GT genes (Top 100)"))
+  if (!is.null(p2)) print(p2)
+}
+
+dev.off()
+
+
+ego_GT <- enrichGO(
+  gene          = gt_genes,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+pdf("GO_BP_GT_genes.pdf", width = 8, height = 6)
+dotplot(ego_GT, showCategory = 12) +
+  ggtitle("GO Biological Processes – Glycosyltransferase (GT) Genes")
+dev.off()
+
+
+# Extract Top 50 NON-GT genes for Metagenes  4, 5,6,7,9
+metagenes_use <- 8
+non_gt_genes  <- setdiff(rownames(W), gt_genes)
+
+get_top50_nonGT <- function(k) {
+  wk <- W[non_gt_genes, k]
+  names(sort(wk, decreasing = TRUE))[1:50]
+}
+
+top50_nonGT <- unique(unlist(lapply(metagenes_use, get_top100_nonGT)))
+
+# GO:BP enrichment for Non-GT genes (Metagene 8)
+ego_nonGT <- enrichGO(
+  gene          = top50_nonGT,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+pdf("GO_BP_nonGT_metagenes_8.pdf", width = 8, height = 6)
+dotplot(ego_nonGT, showCategory = 12) +
+  ggtitle("GO Biological Processes – Non-GT Genes (Metagenes 2, 4, 5)")
+dev.off()
+
+gt_genes <- intersect(gt_genes, rownames(W))
+non_gt_genes <- setdiff(rownames(W), gt_genes)
+
+get_top50_nonGT <- function(k) {
+  wk <- W[non_gt_genes, k]
+  names(sort(wk, decreasing = TRUE))[1:50]
+}
+
+genes_MG8 <- get_top50_nonGT(8)
+
+ego_MG8 <- enrichGO(
+  gene          = genes_MG8,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+pdf("GO_BP_nonGT_Metagene8.pdf", width = 8, height = 6)
+dotplot(ego_MG8, showCategory = 12) + theme(
+  axis.text.y  = element_text(size = 8))
+ggtitle("GO BP – Non-GT Genes (Metagene 8)")
+dev.off()
+
+
+# Convert SYMBOL to ENTREZ
+genes_MG8_entrez <- bitr(
+  genes_MG8,
+  fromType = "SYMBOL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Hs.eg.db
+)$ENTREZID
+
+# KEGG enrichment
+ekegg_MG8 <- enrichKEGG(
+  gene          = genes_MG8_entrez,
+  organism      = "hsa",
+  pAdjustMethod = "BH",
+  qvalueCutoff  = 0.05
+)
+
+# Plot
+pdf("KEGG_nonGT_Metagene8_top50.pdf", width = 6, height = 6)
+dotplot(ekegg_MG4, showCategory = 12) +
+  ggtitle("KEGG Pathways – Non-GT Genes (Metagene 8)") +
+  theme(axis.text.y = element_text(size = 8))
+dev.off()
+
+
+
 # ================================
-# Fully Integrated GT Analysis Script
+# Fully Integrated GT Modeling Script
 # ================================
 
 library(dplyr)
@@ -1134,460 +1126,4 @@ annotate(
     x = "Cancer type comparison",
     y = "Metagene"
   )
-
-
-
-
-
-library(clusterProfiler)
-library(org.Hs.eg.db)
-library(dplyr)
-
-
-genes_all <- rownames(W)
-genes_all <- make.unique(genes_all)
-rownames(W) <- genes_all
-
-#3 Define GT and non-GT gene sets (tumorSymBOLS)
-gt_genes_sym     <- intersect(gt, rownames(W))
-non_gt_genes_sym <- setdiff(rownames(W), gt)
-
-#4) Function: extract TOP 50 genes per metagene
-get_top50 <- function(W, gene_set, k) {
-  wk <- W[gene_set, k, drop = FALSE]
-  top50 <- names(sort(wk[,1], decreasing = TRUE))[1:min(100, nrow(wk))]
-  return(top50)
-}
-
-#5 GO enrichment function (SYMBOL-based)
-  run_go <- function(gene_symbols, title_tag) {
-    
-    ego <- enrichGO(
-      gene          = gene_symbols,
-      OrgDb         = org.Hs.eg.db,
-      keyType       = "SYMBOL",
-      ont           = "BP",
-      pAdjustMethod = "BH",
-      qvalueCutoff  = 0.05,
-      readable      = TRUE
-    )
-    
-    if (is.null(ego) || nrow(ego@result) == 0) {
-      message("No significant GO terms for ", title_tag)
-      return(NULL)
-    }
-    
-    dotplot(ego, showCategory = 10) +
-      ggtitle(title_tag)
-  }
-
-##pick 4,6,ad 9 metagenes 
-# Run GO enrichment for GT vs non-GT (Top 50) per metagene
-pdf("GO_enrichment_GT_vs_nonGT_Top50.pdf", width = 10, height = 7)
-
-for (k in 1:10) {
-  
-  cat("\n===== Metagene", k, "=====\n")
-  
-  # --- GT genes ---
-  top50_GT <- get_top50(W, gt_genes_sym, k)
-  p1 <- run_go(top50_GT,
-               paste("Metagene", k, "- GT genes (Top 100)"))
-  if (!is.null(p1)) print(p1)
-  
-  # --- Non-GT genes ---
-  top50_nonGT <- get_top50(W, non_gt_genes_sym, k)
-  p2 <- run_go(top50_nonGT,
-               paste("Metagene", k, "- Non-GT genes (Top 100)"))
-  if (!is.null(p2)) print(p2)
-}
-
-dev.off()
-
-
-
-
-ego_GT <- enrichGO(
-  gene          = gt_genes,
-  OrgDb         = org.Hs.eg.db,
-  keyType       = "SYMBOL",
-  ont           = "BP",
-  pAdjustMethod = "BH",
-  qvalueCutoff  = 0.05,
-  readable      = TRUE
-)
-
-pdf("GO_BP_GT_genes.pdf", width = 8, height = 6)
-dotplot(ego_GT, showCategory = 12) +
-  ggtitle("GO Biological Processes – Glycosyltransferase (GT) Genes")
-dev.off()
-
-
-# Extract Top 50 NON-GT genes for Metagenes  4, 5,6,7,9
-metagenes_use <- c( 4,6,9)
-non_gt_genes  <- setdiff(rownames(W), gt_genes)
-
-get_top100_nonGT <- function(k) {
-  wk <- W[non_gt_genes, k]
-  names(sort(wk, decreasing = TRUE))[1:100]
-}
-
-top100_nonGT <- unique(unlist(lapply(metagenes_use, get_top100_nonGT)))
-
-# GO:BP enrichment for Non-GT genes (Metagenes 4,6,9)
-ego_nonGT <- enrichGO(
-  gene          = top100_nonGT,
-  OrgDb         = org.Hs.eg.db,
-  keyType       = "SYMBOL",
-  ont           = "BP",
-  pAdjustMethod = "BH",
-  qvalueCutoff  = 0.05,
-  readable      = TRUE
-)
-
-pdf("GO_BP_nonGT_metagenes_4_5_6_7_9.pdf", width = 8, height = 6)
-dotplot(ego_nonGT, showCategory = 12) +
-  ggtitle("GO Biological Processes – Non-GT Genes (Metagenes 2, 4, 5)")
-dev.off()
-
-gt_genes <- c(
-  "GALNT1","GALNT2","GALNT3","GALNT4","GALNT5","GALNT6","GALNT7",
-  "GALNT10","GALNT11","GALNT12","GALNT13",
-  "MGAT1","MGAT5","B3GALT5",
-  "B4GALT1","B4GALT2","B4GALT5",
-  "FUT3",
-  "ST3GAL1","ST3GAL4","ST6GAL1",
-  "OGT","MAN1A1"
-)
-
-gt_genes <- intersect(gt_genes, rownames(W))
-non_gt_genes <- setdiff(rownames(W), gt_genes)
-
-get_top100_nonGT <- function(k) {
-  wk <- W[non_gt_genes, k]
-  names(sort(wk, decreasing = TRUE))[1:100]
-}
-
-genes_MG4 <- get_top100_nonGT(4)
-
-ego_MG4 <- enrichGO(
-  gene          = genes_MG4,
-  OrgDb         = org.Hs.eg.db,
-  keyType       = "SYMBOL",
-  ont           = "BP",
-  pAdjustMethod = "BH",
-  qvalueCutoff  = 0.05,
-  readable      = TRUE
-)
-
-pdf("GO_BP_nonGT_Metagene4.pdf", width = 8, height = 6)
-dotplot(ego_MG4, showCategory = 12) + theme(
-  axis.text.y  = element_text(size = 8))
-  ggtitle("GO BP – Non-GT Genes (Metagene 4)")
-dev.off()
-
-
-
-genes_MG6 <- get_top100_nonGT(6)
-
-ego_MG6 <- enrichGO(
-  gene          = genes_MG6,
-  OrgDb         = org.Hs.eg.db,
-  keyType       = "SYMBOL",
-  ont           = "BP",
-  pAdjustMethod = "BH",
-  qvalueCutoff  = 0.05,
-  readable      = TRUE
-)
-
-pdf("GO_BP_nonGT_Metagene6.pdf", width = 8, height = 6)
-dotplot(ego_MG6, showCategory = 12) + theme(
-  axis.text.y  = element_text(size = 8))
-ggtitle("GO BP – Non-GT Genes (Metagene 6)")
-dev.off()
-
-
-genes_MG9 <- get_top100_nonGT(9)
-
-ego_MG9 <- enrichGO(
-  gene          = genes_MG9,
-  OrgDb         = org.Hs.eg.db,
-  keyType       = "SYMBOL",
-  ont           = "BP",
-  pAdjustMethod = "BH",
-  qvalueCutoff  = 0.05,
-  readable      = TRUE
-)
-
-pdf("GO_BP_nonGT_Metagene9.pdf", width = 8, height = 6)
-dotplot(ego_MG6, showCategory = 12) + theme(
-  axis.text.y  = element_text(size = 8))
-ggtitle("GO BP – Non-GT Genes (Metagene 9)")
-dev.off()
-
-
-#Step A — Prepare GT flag (safe and explicit)
-# GT flag for all genes
-gt_flag_all <- rownames(expr_meta) %in% present_gt
-names(gt_flag_all) <- rownames(expr_meta)
-
-#Step B — Mask correlations exactly as you already do
-cor_masked <- cor_mat
-
-# significance threshold
-sig_thr <- 0.05
-
-# mask non-significant
-cor_masked[p_mat > sig_thr] <- 0
-
-# keep only strong correlations
-cor_masked[abs(cor_masked) < 0.5] <- 0
-
-#Step C — Split GT and non-GT columns
-# Identify GT and non-GT genes that survived filtering
-gt_genes_sig    <- colnames(cor_masked)[gt_flag_all & colSums(abs(cor_masked)) > 0]
-non_gt_genes_sig <- colnames(cor_masked)[!gt_flag_all & colSums(abs(cor_masked)) > 0]
-
-# Subset matrices
-cor_GT     <- cor_masked[, gt_genes_sig, drop = FALSE]
-cor_nonGT  <- cor_masked[, non_gt_genes_sig, drop = FALSE]
-
-#Step D — Column annotation (GT vs non-GT)
-annotation_col <- data.frame(
-  GeneType = c(
-    rep("GT", ncol(cor_GT)),
-    rep("non-GT", ncol(cor_nonGT))
-  )
-)
-
-rownames(annotation_col) <- c(colnames(cor_GT), colnames(cor_nonGT))
-
-#Step E — Combine matrices (GT first, non-GT second)
-cor_combined <- cbind(cor_GT, cor_nonGT)
-
-#Step F — Final heatmap (publication-ready)
-mycol <- colorRampPalette(rev(brewer.pal(11, "RdBu")))(200)
-
-
-# Cluster rows once (shared for both)
-row_clust <- hclust(dist(cor_combined), method = "complete")
-
-# Cluster GT genes
-if (ncol(cor_GT) > 1) {
-  col_clust_GT <- hclust(dist(t(cor_GT)), method = "complete")
-  cor_GT_ord <- cor_GT[, col_clust_GT$order, drop = FALSE]
-} else {
-  cor_GT_ord <- cor_GT
-}
-
-# Cluster non-GT genes
-if (ncol(cor_nonGT) > 1) {
-  col_clust_nonGT <- hclust(dist(t(cor_nonGT)), method = "complete")
-  cor_nonGT_ord <- cor_nonGT[, col_clust_nonGT$order, drop = FALSE]
-} else {
-  cor_nonGT_ord <- cor_nonGT
-}
-
-cor_combined_ord <- cbind(cor_GT_ord, cor_nonGT_ord)
-
-annotation_col_ord <- annotation_col[
-  c(colnames(cor_GT_ord), colnames(cor_nonGT_ord)), , drop = FALSE
-]
-
-pdf("Metagene_GT_nonGT_correlation_heatmap.pdf", width = 10, height = 6)
-pheatmap(
-  cor_combined_ord,
-  cluster_rows = row_clust,
-  cluster_cols = FALSE,      # IMPORTANT
-  color = mycol,
-  annotation_col = annotation_col,
-  annotation_colors = annotation_colors,  
-  fontsize = 11,
-  border_color = NA,
-  breaks = seq(-1, 1, length.out = 201),
-  show_colnames = FALSE,
-  gaps_col = ncol(cor_GT_ord),   # visual separation
-  main = "Metagene–Gene Correlations (|ρ| ≥ 0.5, p ≤ 0.05)\nGT vs non-GT Genes"
-)
-
-dev.off()
-
-metagenes_use <- c( 4,6,9)
-non_gt_genes  <- setdiff(rownames(W), gt_genes)
-
-get_top100_nonGT <- function(k) {
-  wk <- W[non_gt_genes, k]
-  names(sort(wk, decreasing = TRUE))[1:100]
-}
-
-top100_nonGT <- unique(unlist(lapply(metagenes_use, get_top100_nonGT)))
-
-# GO:BP enrichment for Non-GT genes (Metagenes 4,6,9)
-ego_nonGT <- enrichGO(
-  gene          = top100_nonGT,
-  OrgDb         = org.Hs.eg.db,
-  keyType       = "SYMBOL",
-  ont           = "BP",
-  pAdjustMethod = "BH",
-  qvalueCutoff  = 0.05,
-  readable      = TRUE
-)
-
-pdf("GO_BP_nonGT_metagenes_4_6_9.pdf", width = 8, height = 6)
-dotplot(ego_nonGT, showCategory = 12) +
-  ggtitle("GO Biological Processes – Non-GT Genes (Metagenes 2, 4, 5)")
-dev.off()
-
-gt_genes <- c(
-  "GALNT1","GALNT2","GALNT3","GALNT4","GALNT5","GALNT6","GALNT7",
-  "GALNT10","GALNT11","GALNT12","GALNT13",
-  "MGAT1","MGAT5","B3GALT5",
-  "B4GALT1","B4GALT2","B4GALT5",
-  "FUT3",
-  "ST3GAL1","ST3GAL4","ST6GAL1",
-  "OGT","MAN1A1"
-)
-
-gt_genes <- intersect(gt_genes, rownames(W))
-non_gt_genes <- setdiff(rownames(W), gt_genes)
-
-get_top100_nonGT <- function(k) {
-  wk <- W[non_gt_genes, k]
-  names(sort(wk, decreasing = TRUE))[1:100]
-}
-
-genes_MG4 <- get_top100_nonGT(4)
-
-ego_MG4 <- enrichGO(
-  gene          = genes_MG4,
-  OrgDb         = org.Hs.eg.db,
-  keyType       = "SYMBOL",
-  ont           = "BP",
-  pAdjustMethod = "BH",
-  qvalueCutoff  = 0.05,
-  readable      = TRUE
-)
-
-pdf("GO_BP_nonGT_Metagene4_top100.pdf", width = 6, height = 6)
-dotplot(ego_MG4, showCategory = 12) + theme(
-  axis.text.y  = element_text(size = 8))
-ggtitle("GO BP – Non-GT Genes (Metagene 4)")
-dev.off()
-
-
-
-genes_MG6 <- get_top100_nonGT(6)
-
-ego_MG6 <- enrichGO(
-  gene          = genes_MG6,
-  OrgDb         = org.Hs.eg.db,
-  keyType       = "SYMBOL",
-  ont           = "BP",
-  pAdjustMethod = "BH",
-  qvalueCutoff  = 0.05,
-  readable      = TRUE
-)
-
-pdf("GO_BP_nonGT_Metagene6_top100.pdf", width = 6, height = 6)
-dotplot(ego_MG6, showCategory = 12) + theme(
-  axis.text.y  = element_text(size = 8))
-ggtitle("GO BP – Non-GT Genes (Metagene 6)")
-dev.off()
-
-
-genes_MG9 <- get_top100_nonGT(9)
-
-ego_MG9 <- enrichGO(
-  gene          = genes_MG9,
-  OrgDb         = org.Hs.eg.db,
-  keyType       = "SYMBOL",
-  ont           = "BP",
-  pAdjustMethod = "BH",
-  qvalueCutoff  = 0.05,
-  readable      = TRUE
-)
-
-pdf("GO_BP_nonGT_Metagene9_top100.pdf", width = 6, height = 6)
-dotplot(ego_MG9, showCategory = 12) + theme(
-  axis.text.y  = element_text(size = 8))
-ggtitle("GO BP – Non-GT Genes (Metagene 9)")
-dev.off()
-
-
-library(clusterProfiler)
-library(org.Hs.eg.db)
-
-# Convert SYMBOL to ENTREZ
-genes_MG4_entrez <- bitr(
-  genes_MG4,
-  fromType = "SYMBOL",
-  toType   = "ENTREZID",
-  OrgDb    = org.Hs.eg.db
-)$ENTREZID
-
-# KEGG enrichment
-ekegg_MG4 <- enrichKEGG(
-  gene          = genes_MG4_entrez,
-  organism      = "hsa",
-  pAdjustMethod = "BH",
-  qvalueCutoff  = 0.05
-)
-
-# Plot
-pdf("KEGG_nonGT_Metagene4_top100.pdf", width = 6, height = 6)
-dotplot(ekegg_MG4, showCategory = 12) +
-  ggtitle("KEGG Pathways – Non-GT Genes (Metagene 4)") +
-  theme(axis.text.y = element_text(size = 8))
-dev.off()
-
-# Convert SYMBOL to ENTREZ
-genes_MG6_entrez <- bitr(
-  genes_MG6,
-  fromType = "SYMBOL",
-  toType   = "ENTREZID",
-  OrgDb    = org.Hs.eg.db
-)$ENTREZID
-
-# KEGG enrichment
-ekegg_MG6 <- enrichKEGG(
-  gene          = genes_MG6_entrez,
-  organism      = "hsa",
-  pAdjustMethod = "BH",
-  qvalueCutoff  = 0.05
-)
-
-# Plot
-pdf("KEGG_nonGT_Metagene6_top100.pdf", width = 6, height = 6)
-dotplot(ekegg_MG6, showCategory = 12) +
-  ggtitle("KEGG Pathways – Non-GT Genes (Metagene 6)") +
-  theme(axis.text.y = element_text(size = 8))
-dev.off()
-
-
-
-# Convert SYMBOL to ENTREZ
-genes_MG9_entrez <- bitr(
-  genes_MG9,
-  fromType = "SYMBOL",
-  toType   = "ENTREZID",
-  OrgDb    = org.Hs.eg.db
-)$ENTREZID
-
-# KEGG enrichment
-ekegg_MG9 <- enrichKEGG(
-  gene          = genes_MG9_entrez,
-  organism      = "hsa",
-  pAdjustMethod = "BH",
-  qvalueCutoff  = 0.05
-)
-
-# Plot
-pdf("KEGG_nonGT_Metagene9_top100.pdf", width = 6, height = 6)
-dotplot(ekegg_MG9, showCategory = 12) +
-  ggtitle("KEGG Pathways – Non-GT Genes (Metagene 9)") +
-  theme(axis.text.y = element_text(size = 8))
-dev.off()
-
-
-
 
